@@ -58,7 +58,7 @@ def crop_hand(frame, lm):
 # =====================
 # STREAMLIT UI
 # =====================
-st.title("🤟 Sign Language Detector (Teachable Machine TFLite)")
+st.title("SignLink")
 threshold = st.sidebar.slider("Confidence %", 10, 100, 50) / 100
 
 frame_placeholder = st.empty()
