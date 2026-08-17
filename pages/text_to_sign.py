@@ -80,7 +80,7 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("Type your message:")
-    user_text = st.text_input("Type here:", label_visibility="collapsed")
+    user_text = st.text_input("Type here:")
     
     if st.button("Show Signs (from Text)"):
         if user_text:

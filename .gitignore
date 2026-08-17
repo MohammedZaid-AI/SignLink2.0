@@ -1,5 +1,30 @@
+﻿# Python virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE / editor files
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Local/debug files
+camera_snapshot.jpg
+debug_hand_crop.jpg
+test_camera.py
+test_mediapipe.py
+model_diagnostic.py
+
+# Training datasets / large training artifacts
+data/
 best_model.h5
 final_epoch_model.h5
 labels.json
-data/
-venv/
+
+# Training notebooks
+training_notebooks/

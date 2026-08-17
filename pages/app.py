@@ -1,102 +1,309 @@
-import streamlit as st
+import av
 import cv2
 import numpy as np
-import mediapipe as mp
+import streamlit as st
 import tensorflow as tf
+import mediapipe as mp
+
+from pathlib import Path
 from collections import deque
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
 
-# =====================
-# CONFIG
-# =====================
-MODEL_PATH = "model.tflite"   # rename your file to this
-LABELS_PATH = "labels.txt"    # rename "labels" to labels.txt
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+MODEL_PATH = BASE_DIR / "model.tflite"
+LABELS_PATH = BASE_DIR / "labels.txt"
+
 INPUT_SIZE = (224, 224)
-HISTORY = 8
+HISTORY_SIZE = 8
 
-# =====================
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="SignLink - Sign to Speech",
+    page_icon="👋",
+    layout="wide",
+)
+
+
+# ============================================================
 # LOAD LABELS
-# =====================
-with open(LABELS_PATH, "r") as f:
-    class_names = [c.strip() for c in f.readlines()]
+# ============================================================
 
-# =====================
+with open(LABELS_PATH, "r", encoding="utf-8") as f:
+    class_names = [line.strip() for line in f.readlines() if line.strip()]
+
+
+# ============================================================
 # LOAD TFLITE MODEL
-# =====================
-interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-interpreter.allocate_tensors()
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+# ============================================================
 
-# =====================
+@st.cache_resource
+def load_model():
+    interpreter = tf.lite.Interpreter(
+        model_path=str(MODEL_PATH)
+    )
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    return interpreter, input_details, output_details
+
+
+interpreter, input_details, output_details = load_model()
+
+
+# ============================================================
 # MEDIAPIPE
-# =====================
+# ============================================================
+
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=1)
+mp_draw = mp.solutions.drawing_utils
+
+
+# ============================================================
+# PREPROCESSING
+# ============================================================
 
 def preprocess(img):
     img = cv2.resize(img, INPUT_SIZE)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype(np.float32) / 255.0   # TM normalization
-    img = np.expand_dims(img, axis=0)
-    return img
 
-def predict(img):
-    interpreter.set_tensor(input_details[0]['index'], img)
-    interpreter.invoke()
-    return interpreter.get_tensor(output_details[0]['index'])[0]
+    img = cv2.cvtColor(
+        img,
+        cv2.COLOR_BGR2RGB
+    )
 
-def crop_hand(frame, lm):
+    img = img.astype(np.float32) / 255.0
+
+    return np.expand_dims(img, axis=0)
+
+
+# ============================================================
+# HAND CROP
+# ============================================================
+
+def crop_hand(frame, hand_landmarks):
+
     h, w, _ = frame.shape
-    x = [p.x * w for p in lm.landmark]
-    y = [p.y * h for p in lm.landmark]
-    x1 = int(min(x)) - 40
-    x2 = int(max(x)) + 40
-    y1 = int(min(y)) - 40
-    y2 = int(max(y)) + 40
-    return frame[max(0,y1):min(h,y2), max(0,x1):min(w,x2)]
 
-# =====================
-# STREAMLIT UI
-# =====================
-st.title("SignLink")
-threshold = st.sidebar.slider("Confidence %", 10, 100, 50) / 100
+    xs = [
+        int(point.x * w)
+        for point in hand_landmarks.landmark
+    ]
 
-frame_placeholder = st.empty()
-text_placeholder = st.markdown("## Prediction: Waiting...")
+    ys = [
+        int(point.y * h)
+        for point in hand_landmarks.landmark
+    ]
 
-history = deque(maxlen=HISTORY)
-cap = cv2.VideoCapture(0)
-stop = st.button("Stop")
+    padding = 40
 
-while cap.isOpened() and not stop:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    x1 = max(0, min(xs) - padding)
+    y1 = max(0, min(ys) - padding)
 
-    frame = cv2.flip(frame, 1)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb)
+    x2 = min(w, max(xs) + padding)
+    y2 = min(h, max(ys) + padding)
 
-    final_label = "No Hand"
+    crop = frame[y1:y2, x1:x2]
 
-    if results.multi_hand_landmarks:
-        crop = crop_hand(frame, results.multi_hand_landmarks[0])
-        if crop.size > 0:
-            img = preprocess(crop)
-            pred = predict(img)
-            idx = np.argmax(pred)
-            conf = pred[idx]
+    return crop, (x1, y1, x2, y2)
 
-            if conf > threshold:
-                history.append(class_names[idx])  # no need to strip prefix
-            else:
-                history.append("Uncertain")
 
-        if history:
-            final_label = max(set(history), key=history.count)
+# ============================================================
+# VIDEO PROCESSOR
+# ============================================================
 
-    frame_placeholder.image(frame, channels="BGR")
-    text_placeholder.markdown(f"### Prediction: **{final_label}**")
+class SignLinkProcessor:
 
-cap.release()
-cv2.destroyAllWindows()
+    def __init__(self):
+
+        self.hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+        self.history = deque(
+            maxlen=HISTORY_SIZE
+        )
+
+        self.label = "No Hand"
+        self.confidence = 0.0
+
+    def recv(self, frame):
+
+        img = frame.to_ndarray(format="bgr24")
+
+        # Mirror camera
+        img = cv2.flip(img, 1)
+
+        rgb = cv2.cvtColor(
+            img,
+            cv2.COLOR_BGR2RGB
+        )
+
+        results = self.hands.process(rgb)
+
+        self.label = "No Hand"
+        self.confidence = 0.0
+
+        if results.multi_hand_landmarks:
+
+            hand = results.multi_hand_landmarks[0]
+
+            crop, box = crop_hand(
+                img,
+                hand
+            )
+
+            if crop.size > 0:
+
+                processed = preprocess(crop)
+
+                # TensorFlow Lite prediction
+                interpreter.set_tensor(
+                    input_details[0]["index"],
+                    processed
+                )
+
+                interpreter.invoke()
+
+                prediction = interpreter.get_tensor(
+                    output_details[0]["index"]
+                )[0]
+
+                index = int(
+                    np.argmax(prediction)
+                )
+
+                confidence = float(
+                    prediction[index]
+                )
+
+                predicted_label = class_names[index]
+
+                # Store prediction
+                if confidence >= 0.50:
+
+                    self.history.append(
+                        predicted_label
+                    )
+
+                else:
+
+                    self.history.append(
+                        "Uncertain"
+                    )
+
+                # Majority voting
+                if self.history:
+
+                    self.label = max(
+                        set(self.history),
+                        key=self.history.count
+                    )
+
+                self.confidence = confidence
+
+            # Draw MediaPipe landmarks
+            mp_draw.draw_landmarks(
+                img,
+                hand,
+                mp_hands.HAND_CONNECTIONS
+            )
+
+            # Draw bounding box
+            x1, y1, x2, y2 = box
+
+            cv2.rectangle(
+                img,
+                (x1, y1),
+                (x2, y2),
+                (255, 255, 255),
+                2
+            )
+
+        # Prediction text
+        cv2.putText(
+            img,
+            f"{self.label} ({self.confidence * 100:.1f}%)",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (255, 255, 255),
+            2,
+        )
+
+        return av.VideoFrame.from_ndarray(
+            img,
+            format="bgr24"
+        )
+
+
+# ============================================================
+# UI
+# ============================================================
+
+st.title("SignLink 👋")
+
+st.subheader(
+    "Sign-to-Speech"
+)
+
+st.write(
+    "Show one of the supported signs to the camera."
+)
+
+st.info(
+    "Supported signs: Hello • I Love You • Yes • Flower"
+)
+
+
+# ============================================================
+# CAMERA
+# ============================================================
+
+ctx = webrtc_streamer(
+    key="signlink-camera",
+    mode=WebRtcMode.SENDRECV,
+    video_processor_factory=SignLinkProcessor,
+    media_stream_constraints={
+        "video": True,
+        "audio": False,
+    },
+    async_processing=True,
+)
+
+
+# ============================================================
+# INFORMATION
+# ============================================================
+
+st.divider()
+
+st.subheader("How to use")
+
+st.markdown(
+    """
+    1. Click **START** above.
+    2. Allow camera access when your browser asks.
+    3. Place your hand clearly inside the camera view.
+    4. Hold the sign steady for a moment.
+    5. The predicted sign will appear on the video.
+    """
+)
+
+st.caption(
+    "SignLink uses MediaPipe for hand detection and "
+    "a TensorFlow Lite model for sign classification."
+)
