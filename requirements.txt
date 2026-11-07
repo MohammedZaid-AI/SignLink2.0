@@ -1,4 +1,7 @@
-streamlit opencv-python-headless
-tensorflow 
+streamlit
+opencv-python-headless
+tensorflow
 mediapipe
 scikit-learn
+SpeechRecognition
+PyAudio
